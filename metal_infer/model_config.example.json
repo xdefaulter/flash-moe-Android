@@ -1,0 +1,16 @@
+{
+  "model_name": "Qwen3.5-397B-A17B",
+  "num_layers": 60,
+  "hidden_dim": 4096,
+  "num_attention_heads": 32,
+  "num_kv_heads": 2,
+  "head_dim": 256,
+  "vocab_size": 248320,
+  "num_experts": 512,
+  "experts_per_token": 10,
+  "moe_intermediate": 1024,
+  "shared_intermediate": 1024,
+  "full_attn_interval": 4,
+  "bits": 4,
+  "group_size": 64
+}

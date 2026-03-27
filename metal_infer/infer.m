@@ -126,6 +126,116 @@
 
 #define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 
+typedef struct {
+    int loaded;
+    char source_path[1024];
+    char model_name[128];
+    int num_layers;
+    int hidden_dim;
+    int num_attention_heads;
+    int num_kv_heads;
+    int head_dim;
+    int vocab_size;
+    int num_experts;
+    int experts_per_token;
+    int moe_intermediate;
+    int shared_intermediate;
+    int full_attn_interval;
+    int bits;
+    int group_size;
+} ModelConfig;
+
+static void model_config_set_defaults(ModelConfig *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    snprintf(cfg->model_name, sizeof(cfg->model_name), "Qwen3.5-397B-A17B");
+    cfg->num_layers = NUM_LAYERS;
+    cfg->hidden_dim = HIDDEN_DIM;
+    cfg->num_attention_heads = NUM_ATTN_HEADS;
+    cfg->num_kv_heads = NUM_KV_HEADS;
+    cfg->head_dim = HEAD_DIM;
+    cfg->vocab_size = VOCAB_SIZE;
+    cfg->num_experts = NUM_EXPERTS;
+    cfg->experts_per_token = NUM_EXPERTS_PER_TOK;
+    cfg->moe_intermediate = MOE_INTERMEDIATE;
+    cfg->shared_intermediate = SHARED_INTERMEDIATE;
+    cfg->full_attn_interval = FULL_ATTN_INTERVAL;
+    cfg->bits = BITS;
+    cfg->group_size = GROUP_SIZE;
+}
+
+static int json_set_int_if_present(NSDictionary *dict, NSString *key, int *dst) {
+    id val = dict[key];
+    if (!val) return 0;
+    if (![val isKindOfClass:[NSNumber class]]) return -1;
+    *dst = [((NSNumber *)val) intValue];
+    return 1;
+}
+
+static int load_model_config(const char *path, ModelConfig *cfg) {
+    NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
+    if (!data) return 0;
+    NSError *err = nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    if (!obj || ![obj isKindOfClass:[NSDictionary class]]) {
+        fprintf(stderr, "ERROR: invalid model config JSON at %s\n", path);
+        return -1;
+    }
+    NSDictionary *dict = (NSDictionary *)obj;
+
+    id name = dict[@"model_name"];
+    if (name && [name isKindOfClass:[NSString class]]) {
+        snprintf(cfg->model_name, sizeof(cfg->model_name), "%s", [(NSString *)name UTF8String]);
+    }
+
+#define SET_CFG_INT(json_key, field) do { \
+    int _r = json_set_int_if_present(dict, @json_key, &cfg->field); \
+    if (_r < 0) { fprintf(stderr, "ERROR: model config key '%s' must be an integer\n", json_key); return -1; } \
+} while(0)
+    SET_CFG_INT("num_layers", num_layers);
+    SET_CFG_INT("hidden_dim", hidden_dim);
+    SET_CFG_INT("num_attention_heads", num_attention_heads);
+    SET_CFG_INT("num_kv_heads", num_kv_heads);
+    SET_CFG_INT("head_dim", head_dim);
+    SET_CFG_INT("vocab_size", vocab_size);
+    SET_CFG_INT("num_experts", num_experts);
+    SET_CFG_INT("experts_per_token", experts_per_token);
+    SET_CFG_INT("moe_intermediate", moe_intermediate);
+    SET_CFG_INT("shared_intermediate", shared_intermediate);
+    SET_CFG_INT("full_attn_interval", full_attn_interval);
+    SET_CFG_INT("bits", bits);
+    SET_CFG_INT("group_size", group_size);
+#undef SET_CFG_INT
+
+    cfg->loaded = 1;
+    snprintf(cfg->source_path, sizeof(cfg->source_path), "%s", path);
+    return 1;
+}
+
+static int verify_model_config_compat(const ModelConfig *cfg) {
+    int ok = 1;
+#define CHECK_FIELD(field, expected) do { \
+    if (cfg->field != (expected)) { \
+        fprintf(stderr, "ERROR: model_config '%s'=%d but this binary is compiled for %d\n", #field, cfg->field, (expected)); \
+        ok = 0; \
+    } \
+} while(0)
+    CHECK_FIELD(num_layers, NUM_LAYERS);
+    CHECK_FIELD(hidden_dim, HIDDEN_DIM);
+    CHECK_FIELD(num_attention_heads, NUM_ATTN_HEADS);
+    CHECK_FIELD(num_kv_heads, NUM_KV_HEADS);
+    CHECK_FIELD(head_dim, HEAD_DIM);
+    CHECK_FIELD(vocab_size, VOCAB_SIZE);
+    CHECK_FIELD(num_experts, NUM_EXPERTS);
+    CHECK_FIELD(moe_intermediate, MOE_INTERMEDIATE);
+    CHECK_FIELD(shared_intermediate, SHARED_INTERMEDIATE);
+    CHECK_FIELD(full_attn_interval, FULL_ATTN_INTERVAL);
+#undef CHECK_FIELD
+    if (!ok) {
+        fprintf(stderr, "ERROR: this build still uses compile-time tensor dimensions; incompatible model config rejected.\n");
+    }
+    return ok;
+}
+
 // ============================================================================
 // Timing helper
 // ============================================================================
@@ -6499,6 +6609,7 @@ static void serve_loop(
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
     printf("  --model PATH         Model path\n");
+    printf("  --model-config PATH  Optional model_config.json (defaults to MODEL_PATH/model_config.json)\n");
     printf("  --weights PATH       model_weights.bin path\n");
     printf("  --manifest PATH      model_weights.json path\n");
     printf("  --vocab PATH         vocab.bin path\n");
@@ -6525,6 +6636,7 @@ int main(int argc, char **argv) {
     @autoreleasepool {
         const char *model_path = MODEL_PATH_DEFAULT;
         const char *weights_path = NULL;
+        const char *model_config_path = NULL;
         const char *manifest_path = NULL;
         const char *vocab_path = NULL;
         const char *prompt_tokens_path = NULL;
@@ -6534,10 +6646,14 @@ int main(int argc, char **argv) {
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
+        int k_overridden = 0;
+        ModelConfig model_cfg;
+        model_config_set_defaults(&model_cfg);
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
             {"weights",       required_argument, 0, 'w'},
+            {"model-config",  required_argument, 0, 'Q'},
             {"manifest",      required_argument, 0, 'j'},
             {"vocab",         required_argument, 0, 'v'},
             {"prompt-tokens", required_argument, 0, 'p'},
@@ -6562,16 +6678,17 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:Q:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
+                case 'Q': model_config_path = optarg; break;
                 case 'j': manifest_path = optarg; break;
                 case 'v': vocab_path = optarg; break;
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
-                case 'k': K = atoi(optarg); break;
+                case 'k': K = atoi(optarg); k_overridden = 1; break;
                 case 'C': cache_entries = atoi(optarg); break;
                 case 'M': malloc_cache_entries = atoi(optarg); break;
                 case 'L': gpu_linear_attn_enabled = 0; break;
@@ -6628,6 +6745,25 @@ int main(int argc, char **argv) {
             vocab_path = default_vocab;
         }
 
+        // Optional model_config.json (used now for validation + runtime defaults like K).
+        char default_model_config[1024];
+        if (!model_config_path) {
+            snprintf(default_model_config, sizeof(default_model_config), "%s/model_config.json", model_path);
+            if (access(default_model_config, R_OK) == 0) {
+                model_config_path = default_model_config;
+            }
+        }
+        if (model_config_path) {
+            int cfg_res = load_model_config(model_config_path, &model_cfg);
+            if (cfg_res < 0) return 1;
+            if (cfg_res > 0) {
+                if (!verify_model_config_compat(&model_cfg)) return 1;
+                if (!k_overridden && model_cfg.experts_per_token > 0) {
+                    K = model_cfg.experts_per_token;
+                }
+            }
+        }
+
         // ---- Initialize Metal ----
         g_metal = metal_setup();
         if (!g_metal) {
@@ -6648,12 +6784,19 @@ int main(int argc, char **argv) {
             g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
         }
 
-        printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
+        printf("=== %s Metal Inference Engine ===\n", model_cfg.model_name);
         printf("Model:    %s\n", model_path);
+        if (model_cfg.loaded) {
+            printf("Config:   %s\n", model_cfg.source_path);
+        }
         printf("Weights:  %s\n", weights_path);
         printf("Manifest: %s\n", manifest_path);
         printf("Vocab:    %s\n", vocab_path);
         printf("K:        %d experts/layer\n", K);
+        if (K > model_cfg.num_experts) {
+            fprintf(stderr, "ERROR: K=%d exceeds num_experts=%d\n", K, model_cfg.num_experts);
+            return 1;
+        }
         printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
         printf("Tokens:   %d\n", max_tokens);
